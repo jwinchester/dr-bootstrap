@@ -13,16 +13,203 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+PRIMARY_HOST="${ULUHE_PRIMARY:-hetz-1}"
+PRIMARY_SSH_USER="${ULUHE_SSH_USER:-uluhe}"
+ROOT_SSH_USER="${ULUHE_ROOT_SSH_USER:-root}"
+
+# Colors only when stdout is a TTY
+if [ -t 1 ]; then
+  C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_BAD=$'\033[31m'; C_DIM=$'\033[2m'; C_RST=$'\033[0m'
+else
+  C_OK=""; C_WARN=""; C_BAD=""; C_DIM=""; C_RST=""
+fi
+
+check_label() { printf "  %-32s " "$1"; }
+ok()    { printf "${C_OK}OK${C_RST}    %s\n" "${1:-}"; }
+warn()  { printf "${C_WARN}WARN${C_RST}  %s\n" "${1:-}"; }
+bad()   { printf "${C_BAD}FAIL${C_RST}  %s\n" "${1:-}"; }
+note()  { printf "${C_DIM}note${C_RST}  %s\n" "${1:-}"; }
+
 cmd_status() {
-  echo "uluhe status — checking primary at hetz-1..."
-  # TODO: SSH to current primary, check:
-  #   - Tailscale alive
-  #   - Syncthing daemon
-  #   - Restic last-snapshot age (warn if >30 min)
-  #   - Telegram bot processes (3 expected)
-  #   - Disk usage (warn if >80%)
-  #   - Lotor budget (current month spend vs $20 cap)
-  echo "  [TODO: implement health checks]"
+  echo "uluhe status — primary=${PRIMARY_HOST}"
+  echo
+
+  # 1. Reachability via Tailscale SSH
+  check_label "ssh reach (${PRIMARY_SSH_USER}@${PRIMARY_HOST})"
+  if ssh -o BatchMode=yes -o ConnectTimeout=5 "${PRIMARY_SSH_USER}@${PRIMARY_HOST}" true 2>/dev/null; then
+    ok
+  else
+    bad "primary unreachable; remaining checks aborted"
+    return 1
+  fi
+
+  # Pull a single snapshot of host state in one SSH round-trip
+  local probe
+  probe=$(ssh -o BatchMode=yes -o ConnectTimeout=8 "${PRIMARY_SSH_USER}@${PRIMARY_HOST}" '
+    set +e
+    echo "HOST_DATE=$(date -u +%s)"
+    echo "UPTIME=$(awk "{print \$1}" /proc/uptime)"
+    echo "DISK_PCT=$(df -P /home/uluhe | awk "NR==2{gsub(/%/,\"\",\$5); print \$5}")"
+    echo "DISK_FREE=$(df -hP /home/uluhe | awk "NR==2{print \$4}")"
+    echo "MEM_PCT=$(awk "/MemTotal/{t=\$2}/MemAvailable/{a=\$2}END{printf \"%d\", (t-a)*100/t}" /proc/meminfo)"
+    echo "LOAD_1M=$(awk "{print \$1}" /proc/loadavg)"
+    echo "TAILSCALE=$(systemctl is-active tailscaled 2>/dev/null || echo unknown)"
+    echo "SYNCTHING=$(systemctl is-active syncthing@uluhe.service 2>/dev/null || echo unknown)"
+    echo "JOPPA_AGENT=$(systemctl is-active joppa-agent.service 2>/dev/null || echo unknown)"
+    echo "RESTIC_TIMER=$(systemctl is-active restic-backup.timer 2>/dev/null || echo unknown)"
+    echo "RESTIC_FORGET_TIMER=$(systemctl is-active restic-forget.timer 2>/dev/null || echo unknown)"
+    echo "LIBRARY_INTAKE=$(systemctl is-active library-intake.service 2>/dev/null || echo unknown)"
+    # Most recent restic-backup.service finish time + result (needs sudo for system journal)
+    rb=$(sudo -n journalctl -u restic-backup.service -o short-unix --no-pager 2>/dev/null \
+         | grep -E "Finished|Failed with result" | tail -1)
+    echo "RESTIC_LAST=${rb:-none}"
+    # Joppa-agent recent restart count (last hour)
+    ja_restarts=$(sudo -n journalctl -u joppa-agent.service --since "1 hour ago" --no-pager 2>/dev/null \
+                 | grep -c "systemd\[1\]: Started" )
+    echo "JOPPA_AGENT_RESTARTS_1H=${ja_restarts}"
+    echo "LOTOR_TIMER=$(systemctl is-active lotor.timer 2>/dev/null || echo unknown)"
+    if [ -f /home/uluhe/.lotor/state.json ]; then
+      echo "LOTOR_LAST_RUN=$(python3 -c "import json; print(json.load(open(\"/home/uluhe/.lotor/state.json\")).get(\"last_run_ts\",0))" 2>/dev/null || echo 0)"
+    else
+      echo "LOTOR_LAST_RUN=0"
+    fi
+  ' 2>/dev/null)
+
+  # parse into shell vars
+  while IFS='=' read -r k v; do
+    [ -z "$k" ] && continue
+    eval "P_${k}=\"\$v\""
+  done <<< "$probe"
+
+  # 2. Tailscale daemon
+  check_label "tailscaled"
+  case "${P_TAILSCALE:-}" in
+    active) ok ;;
+    *) bad "${P_TAILSCALE:-no-data}" ;;
+  esac
+
+  # 3. Syncthing daemon
+  check_label "syncthing@uluhe"
+  case "${P_SYNCTHING:-}" in
+    active) ok ;;
+    *) bad "${P_SYNCTHING:-no-data}" ;;
+  esac
+
+  # 4. Joppa exec bot
+  check_label "joppa-agent.service"
+  case "${P_JOPPA_AGENT:-}" in
+    active)
+      if [ "${P_JOPPA_AGENT_RESTARTS_1H:-0}" -gt 3 ]; then
+        warn "active but ${P_JOPPA_AGENT_RESTARTS_1H} restarts in last hour"
+      else
+        ok
+      fi
+      ;;
+    *) bad "${P_JOPPA_AGENT:-no-data}" ;;
+  esac
+
+  # 5. Library-intake
+  check_label "library-intake"
+  case "${P_LIBRARY_INTAKE:-}" in
+    active) ok ;;
+    inactive|unknown) note "${P_LIBRARY_INTAKE:-no-data} (optional)" ;;
+    *) warn "${P_LIBRARY_INTAKE}" ;;
+  esac
+
+  # 6. Restic timers
+  check_label "restic-backup.timer (15m)"
+  case "${P_RESTIC_TIMER:-}" in
+    active) ok ;;
+    inactive) warn "paused — investigate before relying on backups" ;;
+    *) bad "${P_RESTIC_TIMER:-no-data}" ;;
+  esac
+  check_label "restic-forget.timer (daily)"
+  case "${P_RESTIC_FORGET_TIMER:-}" in
+    active) ok ;;
+    *) warn "${P_RESTIC_FORGET_TIMER:-no-data}" ;;
+  esac
+
+  # 7. Restic last run
+  check_label "restic last backup"
+  if [ -n "${P_RESTIC_LAST:-}" ] && [ "${P_RESTIC_LAST}" != "none" ]; then
+    local ts result
+    ts=$(echo "${P_RESTIC_LAST}" | awk '{print $1}' | cut -d. -f1)
+    if echo "${P_RESTIC_LAST}" | grep -q "Failed with result"; then
+      result="FAILED"
+    else
+      result="ok"
+    fi
+    if [ -n "$ts" ] && [ "$ts" != "0" ]; then
+      local now age_min
+      now=$(date -u +%s)
+      age_min=$(( (now - ts) / 60 ))
+      if [ "$result" = "FAILED" ]; then
+        bad "last attempt ${age_min}m ago: FAILED"
+      elif [ "$age_min" -gt 30 ]; then
+        warn "${age_min}m ago (>30m threshold)"
+      else
+        ok "${age_min}m ago"
+      fi
+    else
+      warn "couldn't parse timestamp"
+    fi
+  else
+    warn "no restic-backup runs in journal"
+  fi
+
+  # 8. Disk
+  check_label "disk /home/uluhe"
+  if [ -n "${P_DISK_PCT:-}" ]; then
+    if [ "${P_DISK_PCT}" -ge 90 ]; then
+      bad "${P_DISK_PCT}% used (free ${P_DISK_FREE})"
+    elif [ "${P_DISK_PCT}" -ge 80 ]; then
+      warn "${P_DISK_PCT}% used (free ${P_DISK_FREE})"
+    else
+      ok "${P_DISK_PCT}% used (free ${P_DISK_FREE})"
+    fi
+  else
+    warn "no data"
+  fi
+
+  # 9. Memory + load (informational)
+  check_label "mem / load"
+  if [ -n "${P_MEM_PCT:-}" ]; then
+    note "mem ${P_MEM_PCT}% used, 1m load ${P_LOAD_1M:-?}"
+  fi
+
+  # 10. Uptime (show hours under 24h, else days)
+  check_label "uptime"
+  if [ -n "${P_UPTIME:-}" ]; then
+    local up
+    up=$(awk -v u="${P_UPTIME}" 'BEGIN{
+      if (u < 86400) printf "%.1fh", u/3600
+      else printf "%.1f days", u/86400
+    }')
+    note "${up}"
+  fi
+
+  # 11. Lotor heartbeat
+  check_label "lotor.timer + heartbeat"
+  case "${P_LOTOR_TIMER:-}" in
+    active)
+      if [ -n "${P_LOTOR_LAST_RUN:-}" ] && [ "${P_LOTOR_LAST_RUN}" != "0" ]; then
+        local now lotor_age_min
+        now=$(date -u +%s)
+        lotor_age_min=$(( (now - P_LOTOR_LAST_RUN) / 60 ))
+        if [ "$lotor_age_min" -gt 30 ]; then
+          warn "timer active but last run ${lotor_age_min}m ago (>30m — daemon may be stuck)"
+        else
+          ok "last run ${lotor_age_min}m ago"
+        fi
+      else
+        warn "timer active but no state file yet (first run pending?)"
+      fi
+      ;;
+    inactive) note "not deployed (lotor v0 not enabled here)" ;;
+    *) note "${P_LOTOR_TIMER:-no-data}" ;;
+  esac
+
+  echo
 }
 
 cmd_switch() {
