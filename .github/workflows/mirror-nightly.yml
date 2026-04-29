@@ -1,0 +1,50 @@
+name: Nightly mirror to Codeberg + B2
+
+# Mirrors this repo nightly so dr-bootstrap survives a GitHub-side outage
+# (e.g. account suspension, network partition).
+#
+# Targets:
+#   1. Codeberg (https://codeberg.org/jwinchester/dr-bootstrap)
+#   2. B2 tarball: uluhe-secrets/dr-bootstrap-YYYY-MM-DD.tar.gz
+#
+# Secrets needed in repo settings:
+#   CODEBERG_TOKEN    — Codeberg deploy token with push access
+#   B2_ACCOUNT_ID     — B2 application key ID (uluhe-secrets bucket scope)
+#   B2_ACCOUNT_KEY    — B2 application key
+
+on:
+  schedule:
+    - cron: '17 4 * * *'   # 04:17 UTC nightly
+  workflow_dispatch:        # manual trigger from Actions UI
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # TODO: add Codeberg push step
+      # - name: Push to Codeberg
+      #   env:
+      #     CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+      #   run: |
+      #     git remote add codeberg https://jwinchester:${CODEBERG_TOKEN}@codeberg.org/jwinchester/dr-bootstrap.git
+      #     git push codeberg --mirror
+
+      # TODO: add B2 tarball upload step
+      # - name: Upload tarball to B2
+      #   env:
+      #     B2_ACCOUNT_ID:  ${{ secrets.B2_ACCOUNT_ID }}
+      #     B2_ACCOUNT_KEY: ${{ secrets.B2_ACCOUNT_KEY }}
+      #   run: |
+      #     pip install b2
+      #     STAMP=$(date -u +%Y-%m-%d)
+      #     git archive --format=tar.gz HEAD -o /tmp/dr-bootstrap-${STAMP}.tar.gz
+      #     b2 authorize-account "$B2_ACCOUNT_ID" "$B2_ACCOUNT_KEY"
+      #     b2 file upload uluhe-secrets /tmp/dr-bootstrap-${STAMP}.tar.gz dr-bootstrap-${STAMP}.tar.gz
+
+      - name: Stub
+        run: echo "Mirror workflow skeleton — TODO fill in steps"

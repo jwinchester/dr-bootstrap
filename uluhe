@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# uluhe — operator CLI for failover, status, and surge capacity
+#
+# Subcommands:
+#   uluhe status                      # health check on current primary
+#   uluhe switch <vendor> [--test]    # provision new primary on hetzner|do|oracle
+#   uluhe surge --job <name> --days N # quote burst-capacity machine
+#   uluhe --hold                      # cancel a pending auto-failover (5min window)
+#
+# Skeleton: most subcommands are stubs that print intent, not action.
+
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+cmd_status() {
+  echo "uluhe status — checking primary at hetz-1..."
+  # TODO: SSH to current primary, check:
+  #   - Tailscale alive
+  #   - Syncthing daemon
+  #   - Restic last-snapshot age (warn if >30 min)
+  #   - Telegram bot processes (3 expected)
+  #   - Disk usage (warn if >80%)
+  #   - Lotor budget (current month spend vs $20 cap)
+  echo "  [TODO: implement health checks]"
+}
+
+cmd_switch() {
+  local vendor="$1"; shift || true
+  local test_mode=0
+  for arg in "$@"; do
+    [ "$arg" = "--test" ] && test_mode=1
+  done
+
+  case "$vendor" in
+    hetzner|do|oracle) ;;
+    *) echo "ERROR: vendor must be hetzner|do|oracle" >&2; exit 1 ;;
+  esac
+
+  echo "uluhe switch $vendor (test=$test_mode)"
+  echo "  TODO: terraform init -chdir=$REPO_DIR/terraform"
+  echo "  TODO: terraform apply -var=vendor=$vendor"
+  echo "  TODO: SSH operator passphrase to new VM, materialize secrets"
+  echo "  TODO: tail /var/log/joppa-setup.log on new VM until Phase 1 complete"
+  if [ "$test_mode" = 1 ]; then
+    echo "  TODO: tear down test VM after fire-drill"
+  fi
+}
+
+cmd_surge() {
+  echo "uluhe surge — burst capacity quote"
+  echo "  TODO: read price matrix, compute job × duration × vendor"
+}
+
+cmd_hold() {
+  echo "uluhe --hold — cancel pending auto-failover"
+  echo "  TODO: signal Lotor daemon to abort current failover plan"
+}
+
+main() {
+  case "${1:---help}" in
+    status)  shift; cmd_status "$@" ;;
+    switch)  shift; cmd_switch "$@" ;;
+    surge)   shift; cmd_surge "$@" ;;
+    --hold)  shift; cmd_hold "$@" ;;
+    --help|-h)
+      cat <<HELP
+Usage: uluhe <subcommand> [args]
+
+Subcommands:
+  status                 Health check on current primary
+  switch <vendor>        Failover to hetzner|do|oracle
+    --test               Provision throwaway VM, run drill, tear down
+  surge --job NAME --days N
+                         Quote burst-capacity machine for a job
+  --hold                 Cancel pending auto-failover (5min window)
+HELP
+      ;;
+    *) echo "Unknown subcommand: $1" >&2; exit 1 ;;
+  esac
+}
+
+main "$@"

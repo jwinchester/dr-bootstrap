@@ -1,0 +1,48 @@
+#cloud-config
+# Minimal cloud-init for fresh joppa VM. Templated by Terraform with:
+#   - tailscale_auth_key: pre-minted, single-use
+#   - hostname:           target hostname (e.g. hetz-2, do-1, orac-1)
+#
+# This file should ONLY do enough to:
+#   1. set hostname
+#   2. install tailscale + age + git + restic
+#   3. join tailnet
+#   4. clone dr-bootstrap repo
+#   5. hand off to bootstrap/setup.sh
+# Everything else (restore, services, etc.) is in setup.sh so it's testable
+# locally without re-running cloud-init.
+
+hostname: ${hostname}
+
+package_update: true
+package_upgrade: false  # don't upgrade during bootstrap; do it after restore
+
+packages:
+  - curl
+  - git
+  - age
+  - restic
+  - python3
+  - python3-pip
+  - python3-venv
+  - jq
+  - rsync
+
+write_files:
+  - path: /etc/joppa/role
+    content: "primary"
+    permissions: "0644"
+
+runcmd:
+  # Tailscale install + join (single-use auth key, will need rotation post-failover)
+  - curl -fsSL https://tailscale.com/install.sh | sh
+  - tailscale up --auth-key=${tailscale_auth_key} --hostname=${hostname} --ssh
+
+  # Clone dr-bootstrap (TODO: switch to GitHub deploy key + private clone)
+  - mkdir -p /opt/dr-bootstrap
+  - git clone https://github.com/jwinchester/dr-bootstrap.git /opt/dr-bootstrap
+
+  # Hand off to setup.sh — sends progress to TG via bot tokens (decrypted by setup.sh)
+  - cd /opt/dr-bootstrap && bash bootstrap/setup.sh phase1 2>&1 | tee /var/log/joppa-setup.log
+
+final_message: "Cloud-init complete on $${hostname}. Bootstrap continues in setup.sh."

@@ -1,0 +1,13 @@
+.terraform/
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl
+*.tfvars
+!*.tfvars.example
+
+# Local secrets (must NEVER be committed)
+**/secrets/
+*.pem
+*.key
+*.env
+!.env.example
