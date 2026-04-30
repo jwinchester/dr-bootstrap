@@ -215,22 +215,139 @@ cmd_status() {
 cmd_switch() {
   local vendor="$1"; shift || true
   local test_mode=0
+  local destroy=0
+  local skip_confirm=0
   for arg in "$@"; do
-    [ "$arg" = "--test" ] && test_mode=1
+    case "$arg" in
+      --test)        test_mode=1 ;;
+      --destroy)     destroy=1 ;;
+      --yes)         skip_confirm=1 ;;
+      *) echo "WARN: unknown switch arg: $arg" >&2 ;;
+    esac
   done
 
   case "$vendor" in
-    hetzner|do|oracle) ;;
+    hetzner) ;;
+    do|oracle) echo "ERROR: vendor $vendor not yet wired (only hetzner ready 2026-04-30)" >&2; exit 1 ;;
     *) echo "ERROR: vendor must be hetzner|do|oracle" >&2; exit 1 ;;
   esac
 
-  echo "uluhe switch $vendor (test=$test_mode)"
-  echo "  TODO: terraform init -chdir=$REPO_DIR/terraform"
-  echo "  TODO: terraform apply -var=vendor=$vendor"
-  echo "  TODO: SSH operator passphrase to new VM, materialize secrets"
-  echo "  TODO: tail /var/log/joppa-setup.log on new VM until Phase 1 complete"
+  # Locate terraform binary
+  local TF
+  TF="$(command -v terraform 2>/dev/null || echo "$HOME/bin/terraform")"
+  [ -x "$TF" ] || { echo "ERROR: terraform not found (tried PATH and ~/bin/terraform)" >&2; exit 1; }
+
+  # Source the Hetzner token from existing local cli.toml
+  # (DR path: setup.sh::materialize_secrets writes /etc/hcloud/cli.toml on a
+  #  fresh VM. Operator wallypad already has the plaintext at ~/.config/hcloud.)
+  local CLI_TOML="$HOME/.config/hcloud/cli.toml"
+  [ -f "$CLI_TOML" ] || { echo "ERROR: no Hetzner token at $CLI_TOML — materialize from secrets first" >&2; exit 1; }
+  HCLOUD_TOKEN="$(awk -F'"' '/^[[:space:]]*token *=/{print $2; exit}' "$CLI_TOML")"
+  [ -n "$HCLOUD_TOKEN" ] || { echo "ERROR: couldn't extract token from $CLI_TOML" >&2; exit 1; }
+  export HCLOUD_TOKEN
+
+  local TF_DIR="$REPO_DIR/terraform"
+  cd "$TF_DIR" || { echo "ERROR: terraform dir missing at $TF_DIR" >&2; exit 1; }
+
+  # ---- Destroy path ----
+  if [ "$destroy" = 1 ]; then
+    echo "uluhe switch $vendor --destroy"
+    echo
+    "$TF" show -no-color 2>/dev/null | grep -E "^# hcloud_server\." || {
+      echo "(nothing in state to destroy — already clean)"
+      return 0
+    }
+    if [ "$skip_confirm" = 0 ]; then
+      printf "Confirm destroy? (yes/no) "
+      read -r confirm
+      [ "$confirm" = "yes" ] || { echo "aborted"; return 1; }
+    fi
+    "$TF" destroy -auto-approve -var=vm_hostname=ignored
+    return $?
+  fi
+
+  # ---- Apply path ----
+  local default_hostname
   if [ "$test_mode" = 1 ]; then
-    echo "  TODO: tear down test VM after fire-drill"
+    default_hostname="hetz-test"
+  else
+    default_hostname="hetz-$(date +%Y%m%d)"
+  fi
+
+  printf "VM hostname [%s]: " "$default_hostname"
+  read -r VM_HOSTNAME
+  VM_HOSTNAME="${VM_HOSTNAME:-$default_hostname}"
+
+  echo "Tailscale single-use auth key (paste; input hidden):"
+  echo "  Mint at https://login.tailscale.com/admin/settings/keys"
+  printf "Key: "
+  read -rs TS_AUTH_KEY
+  echo
+  [ -n "$TS_AUTH_KEY" ] || { echo "ERROR: tailscale auth key required" >&2; exit 1; }
+
+  echo
+  echo "Will provision Hetzner VM:"
+  echo "  hostname:    $VM_HOSTNAME"
+  echo "  type:        cax31 (4 vCPU ARM / 8 GB / 160 GB / €14/mo)"
+  echo "  region:      hel1 (Helsinki)"
+  echo "  test mode:   $test_mode"
+  echo
+  if [ "$test_mode" = 1 ]; then
+    echo "TEST MODE — VM will boot to verify the provisioning chain. Tear down with:"
+    echo "  ./uluhe switch hetzner --destroy"
+  else
+    echo "REAL FAILOVER — VM stays up. Standing cost: ~€14/mo from creation."
+  fi
+  echo
+
+  if [ "$skip_confirm" = 0 ]; then
+    printf "Proceed? (yes/no) "
+    read -r confirm
+    [ "$confirm" = "yes" ] || { echo "aborted"; return 1; }
+  fi
+
+  echo
+  echo "[1/3] terraform init"
+  "$TF" init -upgrade -no-color || { echo "ERROR: terraform init failed" >&2; return 1; }
+
+  echo
+  echo "[2/3] terraform apply"
+  "$TF" apply -auto-approve -no-color \
+    -var=vendor=hetzner \
+    -var=vm_hostname="$VM_HOSTNAME" \
+    -var=tailscale_auth_key="$TS_AUTH_KEY" \
+    || { echo "ERROR: terraform apply failed" >&2; return 1; }
+  unset TS_AUTH_KEY
+
+  echo
+  echo "[3/3] capture outputs + report"
+  local IPV4 IPV6 STATUS
+  IPV4="$("$TF" output -raw joppa_ipv4 2>/dev/null)"
+  IPV6="$("$TF" output -raw joppa_ipv6 2>/dev/null)"
+  STATUS="$("$TF" output -raw joppa_status 2>/dev/null)"
+
+  echo
+  echo "============================================="
+  echo "  VM provisioned: $VM_HOSTNAME"
+  echo "  IPv4:    $IPV4"
+  echo "  IPv6:    $IPV6"
+  echo "  Status:  $STATUS"
+  echo "============================================="
+  echo
+  echo "cloud-init is now running on the VM (apt updates, tailscale install,"
+  echo "dr-bootstrap clone, then setup.sh phase1 — which will FAIL gracefully"
+  echo "until secrets are placed; that's expected for --test mode)."
+  echo
+  echo "Next steps:"
+  echo "  Watch boot:    ssh root@$IPV4 'tail -f /var/log/joppa-setup.log'"
+  echo "  After tailscale joins (~2 min):"
+  echo "                 ssh root@$VM_HOSTNAME 'systemctl is-active tailscaled'"
+  if [ "$test_mode" = 1 ]; then
+    echo
+    echo "When done verifying:"
+    echo "  ./uluhe switch hetzner --destroy"
+    echo
+    echo "(does not auto-tear-down — operator chooses when)"
   fi
 }
 
@@ -256,8 +373,10 @@ Usage: uluhe <subcommand> [args]
 
 Subcommands:
   status                 Health check on current primary
-  switch <vendor>        Failover to hetzner|do|oracle
-    --test               Provision throwaway VM, run drill, tear down
+  switch <vendor>        Failover to hetzner (only one wired so far)
+    --test               Boot a throwaway VM to verify the provisioning chain
+    --destroy            Tear down whatever's in terraform state
+    --yes                Skip confirmation prompts (DANGEROUS)
   surge --job NAME --days N
                          Quote burst-capacity machine for a job
   --hold                 Cancel pending auto-failover (5min window)
