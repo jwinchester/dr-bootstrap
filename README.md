@@ -39,7 +39,7 @@ Canonical: [`scratch/dr-design/DESIGN_v2.md`](https://github.com/...) in the jop
 - [ ] Hetzner / DO / Oracle API tokens stored age-encrypted, decrypted into Terraform variables at runtime
 - [ ] Terraform remote state in B2 (or local fallback)
 - [x] `setup.sh` Phase 1 wired to restic + age-key.enc + joppa-bots venv rebuild (2026-04-30) — materialize_secrets + restic restore + rebuild_joppa_bots_runtime live; phase2/3 still skeletons
-- [ ] `setup.sh`: agent.env + ANTHROPIC_API_KEY DR gap (out of bot-tokens.enc scope) — operator hand-place required after failover; both joppa-agent.service AND lotor.service depend on this file
+- [x] `setup.sh`: agent.env + ANTHROPIC_API_KEY DR gap closed (2026-04-30) — `secrets/agent-tokens.enc` bundle on wallypad; materialize_secrets decrypts it → `/etc/joppa-bots/agent.env`. Pending: operator runs `scripts/push-secrets-to-b2.sh` to put it in B2 for failover-side fetch.
 - [ ] `./uluhe switch <vendor>`: replace stub with vendor provisioning logic
 - [x] `./uluhe status`: real health check (2026-04-29)
 - [ ] cloud-init.yaml: bake in tailscale + claude-code preinstall

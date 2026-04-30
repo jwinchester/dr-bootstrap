@@ -208,18 +208,18 @@ for name, fname in NAME_TO_FILE.items():
 PY
   chown -R root:root /etc/joppa-bots
 
-  # --- agent.env DR gap ---
-  # @Jonclaudemandam_bot's BOT_TOKEN and ANTHROPIC_API_KEY are NOT in any
-  # age-encrypted bundle (intentional: out of scope here). On a fresh VM,
-  # BOTH joppa-agent.service AND lotor.service will fail to start until the
-  # operator hand-places:
-  #   /etc/joppa-bots/agent.env  (BOT_TOKEN=, OPERATOR_CHAT_ID=, ANTHROPIC_API_KEY=)
-  # Both unit files have `EnvironmentFile=/etc/joppa-bots/agent.env` (no leading
-  # dash → required). Lotor uses BOT_TOKEN to send its own alerts; joppa-agent
-  # additionally needs ANTHROPIC_API_KEY for the Claude SDK.
-  # Reserve bots (mih/midpen/inaturalist) are parked, so their absence is silent.
-  if [ ! -f /etc/joppa-bots/agent.env ]; then
-    log "  WARN: /etc/joppa-bots/agent.env not present — joppa-agent.service AND lotor.service will both fail to start until operator hand-places it"
+  # --- /etc/joppa-bots/agent.env (joppa-agent + lotor exec env) ---
+  # Holds BOT_TOKEN (@Jonclaudemandam_bot) + OPERATOR_CHAT_ID + ANTHROPIC_API_KEY.
+  # Both joppa-agent.service AND lotor.service have `EnvironmentFile=/etc/joppa-bots/agent.env`
+  # (required, no leading dash). Lotor uses BOT_TOKEN for its own alerts;
+  # joppa-agent additionally needs ANTHROPIC_API_KEY for the Claude SDK.
+  if [ -f "$SECRETS_DIR/agent-tokens.enc" ]; then
+    log "  agent-tokens.enc → /etc/joppa-bots/agent.env"
+    decrypt_with_identity "$SECRETS_DIR/agent-tokens.enc" /etc/joppa-bots/agent.env
+    chown root:root /etc/joppa-bots/agent.env
+    chmod 0600 /etc/joppa-bots/agent.env
+  else
+    log "  WARN: $SECRETS_DIR/agent-tokens.enc not present — /etc/joppa-bots/agent.env not populated; joppa-agent.service AND lotor.service will fail to start until operator hand-places it"
   fi
 
   # --- privacy-cards.csv → tmpfs (volatile, never on disk) ---
