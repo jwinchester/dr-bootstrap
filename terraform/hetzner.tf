@@ -27,9 +27,15 @@ provider "hcloud" {
   # token from HCLOUD_TOKEN env var
 }
 
-resource "hcloud_ssh_key" "operator" {
-  name       = "operator-${var.vm_hostname}"
-  public_key = file("~/.ssh/id_ed25519.pub")
+# Look up the operator's pre-existing Hetzner SSH key by name.
+# Assumption: the key is already uploaded to the Hetzner project (it is, as of
+# 2026-04-30 — uploaded for midpen worker provisioning). If absent on a fresh
+# project, run once before this terraform:
+#   hcloud ssh-key create --name wallypad --public-key-from-file ~/.ssh/id_ed25519.pub
+# Using a data source (not a resource) means terraform won't try to re-upload
+# and won't delete the key on `terraform destroy` — both desirable.
+data "hcloud_ssh_key" "operator" {
+  name = "wallypad"
 }
 
 resource "hcloud_server" "joppa" {
@@ -37,7 +43,7 @@ resource "hcloud_server" "joppa" {
   image       = "ubuntu-24.04"
   server_type = "cax31" # ARM (Ampere). Change to "cpx31" for x86.
   location    = "hel1"  # Helsinki. See header for alternatives.
-  ssh_keys    = [hcloud_ssh_key.operator.id]
+  ssh_keys    = [data.hcloud_ssh_key.operator.id]
 
   user_data = templatefile("${path.module}/../bootstrap/cloud-init.yaml", {
     tailscale_auth_key = var.tailscale_auth_key
