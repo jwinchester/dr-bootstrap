@@ -212,16 +212,232 @@ cmd_status() {
   echo
 }
 
+# orchestrate_phase1 — drive secrets-fetch + setup.sh phase1 over SSH against
+# a freshly-provisioned VM. Called from cmd_switch after terraform apply.
+#
+# Flow:
+#   1. Wait for sshd; wait for cloud-init to finish (cloud-init status --wait)
+#   2. Locally decrypt b2-keys.enc → extract `secrets-uluhe` keyID + applicationKey
+#      (passphrase prompt #1 of 2)
+#   3. scp scripts/fetch-secrets-from-b2.sh to VM, run it with B2 creds piped
+#      via stdin (never on command line, never persisted)
+#   4. ssh -t for setup.sh phase1 — operator types passphrase at the VM-side
+#      age prompt (passphrase prompt #2 of 2; same passphrase, different sides)
+#   5. Report exit; on failure, stream tail of /var/log/joppa-setup.log
+#
+# Args: $1=ipv4, $2=hostname, $3=test_mode (0|1)
+# Uses operator's wallypad SSH key (uploaded to Hetzner project as "wallypad");
+# sshd on Hetzner public IPv4 is reachable before Tailscale converges.
+orchestrate_phase1() {
+  local ipv4="$1" hostname="$2" test_mode="${3:-0}"
+
+  echo
+  echo "================ orchestrate phase1 ================"
+  echo "  Target:    root@${ipv4}  (hostname=${hostname})"
+  echo "===================================================="
+  echo
+
+  # ---- Step 1: wait for sshd + cloud-init ----
+  echo "[orch 1/4] waiting for sshd on ${ipv4} (up to ~2min)…"
+  local i sshok=0
+  for i in $(seq 1 30); do
+    if ssh -o ConnectTimeout=5 \
+           -o StrictHostKeyChecking=accept-new \
+           -o UserKnownHostsFile=/dev/null \
+           -o BatchMode=yes \
+           "root@${ipv4}" 'true' 2>/dev/null; then
+      sshok=1; break
+    fi
+    printf "."; sleep 4
+  done
+  echo
+  if [ "$sshok" = 0 ]; then
+    echo "ERROR: sshd unreachable on ${ipv4} after ~2min" >&2
+    return 1
+  fi
+  ok "sshd reachable"
+
+  echo "[orch 2/4] waiting for cloud-init to finish (this is the apt-update + tailscale-install + git-clone leg; max 10min)…"
+  if ! timeout 600 ssh -o StrictHostKeyChecking=accept-new \
+           -o UserKnownHostsFile=/dev/null \
+           "root@${ipv4}" 'cloud-init status --wait'; then
+    echo "ERROR: cloud-init failed or timed out on ${ipv4}" >&2
+    echo "  Inspect: ssh root@${ipv4} 'cat /var/log/cloud-init-output.log'" >&2
+    return 1
+  fi
+  ok "cloud-init complete"
+
+  # ---- Step 2: extract B2 secrets-uluhe creds locally ----
+  echo "[orch 3/4] extracting B2 secrets-uluhe key from local b2-keys.enc"
+  echo "  (you will be prompted for the age passphrase — 1st of 2 prompts)"
+
+  local SECRETS_DIR_LOCAL="${REPO_DIR}/../secrets"
+  local AGE_KEY_ENC_LOCAL="${HOME}/.config/dr/age-key.enc"
+  local B2_KEYS_ENC="${SECRETS_DIR_LOCAL}/b2-keys.enc"
+  local FETCH_SCRIPT="${REPO_DIR}/../scripts/fetch-secrets-from-b2.sh"
+
+  [ -f "$AGE_KEY_ENC_LOCAL" ] || { echo "ERROR: missing $AGE_KEY_ENC_LOCAL" >&2; return 1; }
+  [ -f "$B2_KEYS_ENC" ]       || { echo "ERROR: missing $B2_KEYS_ENC" >&2; return 1; }
+  [ -f "$FETCH_SCRIPT" ]      || { echo "ERROR: missing $FETCH_SCRIPT" >&2; return 1; }
+
+  local TMPDIR_ORCH
+  TMPDIR_ORCH="$(mktemp -d -t uluhe-orch-XXXXXX)"
+  chmod 700 "$TMPDIR_ORCH"
+  # Local cleanup trap (overrides any earlier RETURN trap on this function).
+  # shellcheck disable=SC2064
+  trap "find '$TMPDIR_ORCH' -type f -exec shred -u {} \\; 2>/dev/null; rm -rf '$TMPDIR_ORCH'" RETURN
+
+  if ! age -d -o "$TMPDIR_ORCH/id" "$AGE_KEY_ENC_LOCAL"; then
+    echo "ERROR: age identity decrypt failed (wrong passphrase?)" >&2
+    return 1
+  fi
+  if ! age -d -i "$TMPDIR_ORCH/id" -o "$TMPDIR_ORCH/b2-keys.txt" "$B2_KEYS_ENC"; then
+    echo "ERROR: b2-keys.enc decrypt failed" >&2
+    return 1
+  fi
+
+  local b2_id b2_key
+  # `|| true` so that a python parser failure (which writes to stderr but no
+  # stdout) doesn't trigger set -e before the empty-cred guard below runs.
+  read -r b2_id b2_key < <(python3 - "$TMPDIR_ORCH/b2-keys.txt" <<'PY'
+import sys
+src = sys.argv[1]
+LABELS = {"keyID","keyName","applicationKey"}
+lines = [ln.rstrip("\n") for ln in open(src)]
+entries, cur, i = [], {}, 0
+while i < len(lines):
+    s = lines[i].strip()
+    if not s:
+        if cur: entries.append(cur); cur = {}
+        i += 1; continue
+    if s.endswith(":") and s[:-1] in LABELS:
+        label = s[:-1]
+        j = i + 1
+        while j < len(lines) and not lines[j].strip(): j += 1
+        if j < len(lines):
+            if label in cur: entries.append(cur); cur = {}
+            cur[label] = lines[j].strip()
+        i = j + 1
+    else:
+        i += 1
+if cur: entries.append(cur)
+target = next((e for e in entries if e.get("keyName") == "secrets-uluhe"), None)
+if not target:
+    sys.stderr.write("FAIL: secrets-uluhe not in b2-keys.enc; available: " +
+        ", ".join(repr(e.get("keyName")) for e in entries) + "\n")
+    sys.exit(1)
+print(target["keyID"], target["applicationKey"])
+PY
+  ) || true
+  if [ -z "$b2_id" ] || [ -z "$b2_key" ]; then
+    echo "ERROR: secrets-uluhe creds not extracted" >&2
+    return 1
+  fi
+  ok "secrets-uluhe extracted (id prefix: ${b2_id:0:8}…)"
+
+  # ---- Step 3: copy fetch script + run on VM with creds via stdin ----
+  echo "[orch 4/4] copying fetch-secrets-from-b2.sh to VM and running it"
+
+  if ! ssh -o StrictHostKeyChecking=accept-new \
+            -o UserKnownHostsFile=/dev/null \
+            "root@${ipv4}" \
+            'mkdir -p /opt/dr-bootstrap/scripts /opt/dr-bootstrap/secrets && chmod 700 /opt/dr-bootstrap/secrets'; then
+    echo "ERROR: dir create on VM failed" >&2; return 1
+  fi
+  if ! scp -o StrictHostKeyChecking=accept-new \
+            -o UserKnownHostsFile=/dev/null \
+            "$FETCH_SCRIPT" "root@${ipv4}:/opt/dr-bootstrap/scripts/fetch-secrets-from-b2.sh"; then
+    echo "ERROR: scp fetch-secrets-from-b2.sh failed" >&2; return 1
+  fi
+  ssh -o StrictHostKeyChecking=accept-new \
+      -o UserKnownHostsFile=/dev/null \
+      "root@${ipv4}" 'chmod +x /opt/dr-bootstrap/scripts/fetch-secrets-from-b2.sh'
+
+  # Overwrite the cloud-init-cloned setup.sh with the local working copy.
+  # Lets us iterate setup.sh without needing a github push between attempts;
+  # the source-of-truth in dr-bootstrap repo can lag during fire-drills.
+  local LOCAL_SETUP="${REPO_DIR}/bootstrap/setup.sh"
+  if [ -f "$LOCAL_SETUP" ]; then
+    if ! scp -o StrictHostKeyChecking=accept-new \
+              -o UserKnownHostsFile=/dev/null \
+              "$LOCAL_SETUP" "root@${ipv4}:/opt/dr-bootstrap/bootstrap/setup.sh"; then
+      echo "ERROR: scp setup.sh failed" >&2; return 1
+    fi
+    ok "setup.sh: local working copy synced (overrides cloned version)"
+  fi
+
+  # Pipe B2 creds via stdin → remote shell `read`s into env vars → script invoked.
+  # Never on command line, never to disk. Vars die when the remote shell exits.
+  if ! ssh -o StrictHostKeyChecking=accept-new \
+           -o UserKnownHostsFile=/dev/null \
+           "root@${ipv4}" '
+             set -e
+             read -r B2_SECRETS_KEY_ID
+             read -r B2_SECRETS_KEY
+             export B2_SECRETS_KEY_ID B2_SECRETS_KEY
+             bash /opt/dr-bootstrap/scripts/fetch-secrets-from-b2.sh
+           ' <<EOF
+$b2_id
+$b2_key
+EOF
+  then
+    echo "ERROR: fetch-secrets-from-b2.sh on VM failed" >&2; return 1
+  fi
+  unset b2_id b2_key
+  ok "secrets/*.enc fetched onto VM (/opt/dr-bootstrap/secrets/)"
+
+  # ---- Step 4: drive setup.sh phase1 with PTY for age passphrase prompt ----
+  echo
+  echo "================ setup.sh phase1 ================"
+  echo "  Operator: type the age passphrase when prompted (2nd of 2)."
+  echo "  phase1 runs: materialize_secrets → restic restore latest → /"
+  echo "             → rebuild_joppa_bots_runtime → enable timers + services"
+  echo "  Expected duration: 3-5 min (restic restore is the dominant term)."
+  echo "================================================="
+  echo
+
+  # In test mode, set SKIP_ENABLE=1 so phase1 doesn't bring services online
+  # (would collide with hetz-1's bot token + restic repo + lotor alerts).
+  local skip_enable_arg=""
+  if [ "$test_mode" = 1 ]; then
+    skip_enable_arg="SKIP_ENABLE=1 "
+    echo "  (test mode: SKIP_ENABLE=1 — units restored but not enabled, to avoid hetz-1 collision)"
+  fi
+
+  local phase1_rc=0
+  ssh -t -o StrictHostKeyChecking=accept-new \
+         -o UserKnownHostsFile=/dev/null \
+         "root@${ipv4}" "cd /opt/dr-bootstrap && ${skip_enable_arg}bash bootstrap/setup.sh phase1" \
+    || phase1_rc=$?
+
+  if [ "$phase1_rc" -ne 0 ]; then
+    echo
+    echo "ERROR: setup.sh phase1 exited rc=${phase1_rc}. Last 40 log lines:" >&2
+    ssh "root@${ipv4}" 'tail -40 /var/log/joppa-setup.log 2>/dev/null || echo "(no log)"' >&2 || true
+    return "$phase1_rc"
+  fi
+
+  echo
+  ok "phase1 complete on ${hostname}"
+  echo
+  echo "Verify:  ULUHE_PRIMARY=${hostname} ./uluhe status"
+  if [ "$test_mode" = 1 ]; then
+    echo "Tear down:  ./uluhe switch hetzner --destroy"
+  fi
+}
+
 cmd_switch() {
   local vendor="$1"; shift || true
   local test_mode=0
   local destroy=0
   local skip_confirm=0
+  local orchestrate=1   # default-on; set to 0 with --no-orchestrate for bare-provision debugging
   for arg in "$@"; do
     case "$arg" in
-      --test)        test_mode=1 ;;
-      --destroy)     destroy=1 ;;
-      --yes)         skip_confirm=1 ;;
+      --test)            test_mode=1 ;;
+      --destroy)         destroy=1 ;;
+      --yes)             skip_confirm=1 ;;
+      --no-orchestrate)  orchestrate=0 ;;
       *) echo "WARN: unknown switch arg: $arg" >&2 ;;
     esac
   done
@@ -335,19 +551,29 @@ cmd_switch() {
   echo "============================================="
   echo
   echo "cloud-init is now running on the VM (apt updates, tailscale install,"
-  echo "dr-bootstrap clone, then setup.sh phase1 — which will FAIL gracefully"
-  echo "until secrets are placed; that's expected for --test mode)."
-  echo
-  echo "Next steps:"
-  echo "  Watch boot:    ssh root@$IPV4 'tail -f /var/log/joppa-setup.log'"
-  echo "  After tailscale joins (~2 min):"
-  echo "                 ssh root@$VM_HOSTNAME 'systemctl is-active tailscaled'"
-  if [ "$test_mode" = 1 ]; then
+  echo "dr-bootstrap clone). Provisioning-only — phase1 is driven by this wrapper."
+
+  if [ "$orchestrate" = 0 ]; then
     echo
-    echo "When done verifying:"
-    echo "  ./uluhe switch hetzner --destroy"
+    echo "--no-orchestrate set; halting after provisioning."
+    echo "Next steps (manual):"
+    echo "  Watch boot:    ssh root@$IPV4 'cloud-init status --wait'"
+    echo "  Then:          ssh root@$IPV4 'cd /opt/dr-bootstrap && bash bootstrap/setup.sh phase1'"
+    if [ "$test_mode" = 1 ]; then
+      echo
+      echo "When done verifying:"
+      echo "  ./uluhe switch hetzner --destroy"
+    fi
+    return 0
+  fi
+
+  # Default path: drive secrets-fetch + phase1 over SSH.
+  if ! orchestrate_phase1 "$IPV4" "$VM_HOSTNAME" "$test_mode"; then
     echo
-    echo "(does not auto-tear-down — operator chooses when)"
+    echo "ERROR: orchestration failed. VM is still up at $IPV4." >&2
+    echo "  Inspect:   ssh root@$IPV4" >&2
+    echo "  Tear down: ./uluhe switch hetzner --destroy" >&2
+    return 1
   fi
 }
 
@@ -374,9 +600,11 @@ Usage: uluhe <subcommand> [args]
 Subcommands:
   status                 Health check on current primary
   switch <vendor>        Failover to hetzner (only one wired so far)
-    --test               Boot a throwaway VM to verify the provisioning chain
+    --test               Boot a throwaway VM end-to-end (provision + phase1)
     --destroy            Tear down whatever's in terraform state
     --yes                Skip confirmation prompts (DANGEROUS)
+    --no-orchestrate     Stop after terraform apply; don't drive phase1 over SSH
+                         (debugging escape hatch — default is to orchestrate)
   surge --job NAME --days N
                          Quote burst-capacity machine for a job
   --hold                 Cancel pending auto-failover (5min window)

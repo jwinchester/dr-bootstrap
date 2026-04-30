@@ -18,6 +18,11 @@
 #   B2_RESTIC_REPO       restic repo URL (default: b2:uluhe-restic)
 #   RUNTIME_TMPFS        tmpfs mount for ephemeral plaintext (default: /run/joppa)
 #   OPERATOR_CHAT_ID     written into bot env files (default: 8628318993)
+#   SKIP_ENABLE          if "1", phase1 does restore + venv rebuild but does
+#                          NOT systemctl enable --now any service. Used by
+#                          ./uluhe switch hetzner --test so the test VM
+#                          doesn't collide with hetz-1 (same bot token,
+#                          same restic repo, double Lotor alerts).
 #
 # Prereqs (cloud-init handles these on a fresh VM):
 #   - tailscale, age, restic, git, python3, jq installed
@@ -313,16 +318,27 @@ phase1() {
 
   rebuild_joppa_bots_runtime
 
-  log "enabling timers + services"
-  systemctl enable --now library-intake.service || log "WARN: library-intake start failed"
-  systemctl enable --now restic-backup.timer    || log "WARN: restic-backup.timer enable failed"
-  systemctl enable --now restic-forget.timer    || log "WARN: restic-forget.timer enable failed"
-  systemctl enable --now lotor.timer            || log "WARN: lotor.timer enable failed"
-
-  if [ -f /etc/joppa-bots/agent.env ]; then
-    systemctl enable --now joppa-agent.service || log "WARN: joppa-agent failed to start"
+  if [ "${SKIP_ENABLE:-0}" = 1 ]; then
+    log "SKIP_ENABLE=1: leaving timers + services disabled (test mode — would"
+    log "  otherwise collide with hetz-1's bot token, restic repo, lotor alerts)"
+    log "  Verifying units are in place via systemctl is-enabled (note: 'static'"
+    log "  or 'enabled' both mean the unit file is on disk and resolvable):"
+    for u in library-intake.service restic-backup.timer restic-forget.timer \
+             lotor.timer joppa-agent.service; do
+      log "    $u: $(systemctl is-enabled "$u" 2>/dev/null || echo not-found)"
+    done
   else
-    log "SKIP joppa-agent.service: agent.env missing (see materialize_secrets warning)"
+    log "enabling timers + services"
+    systemctl enable --now library-intake.service || log "WARN: library-intake start failed"
+    systemctl enable --now restic-backup.timer    || log "WARN: restic-backup.timer enable failed"
+    systemctl enable --now restic-forget.timer    || log "WARN: restic-forget.timer enable failed"
+    systemctl enable --now lotor.timer            || log "WARN: lotor.timer enable failed"
+
+    if [ -f /etc/joppa-bots/agent.env ]; then
+      systemctl enable --now joppa-agent.service || log "WARN: joppa-agent failed to start"
+    else
+      log "SKIP joppa-agent.service: agent.env missing (see materialize_secrets warning)"
+    fi
   fi
 
   # TODO: send "Phase 1 complete" via @Jonclaudemandam_bot (needs joppa_alert.py

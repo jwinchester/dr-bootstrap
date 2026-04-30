@@ -3,14 +3,17 @@
 #   - tailscale_auth_key: pre-minted, single-use
 #   - hostname:           target hostname (e.g. hetz-2, do-1, orac-1)
 #
+# Provisioning-only — does NOT invoke setup.sh phase1. The operator wrapper
+# (./uluhe switch <vendor>) drives phase1 over Tailscale SSH so the age
+# passphrase is entered against an interactive PTY and B2 bootstrap creds
+# never sit in cloud metadata.
+#
 # This file should ONLY do enough to:
 #   1. set hostname
-#   2. install tailscale + age + git + restic
+#   2. install tailscale + age + git + restic + python deps
 #   3. join tailnet
-#   4. clone dr-bootstrap repo
-#   5. hand off to bootstrap/setup.sh
-# Everything else (restore, services, etc.) is in setup.sh so it's testable
-# locally without re-running cloud-init.
+#   4. clone dr-bootstrap repo (so wrapper can ssh in and run setup.sh)
+# Restore + services + secrets handoff happen in setup.sh, driven from wallypad.
 
 hostname: ${hostname}
 
@@ -42,8 +45,8 @@ runcmd:
   - mkdir -p /opt/dr-bootstrap
   - git clone https://github.com/jwinchester/dr-bootstrap.git /opt/dr-bootstrap
 
-  # Hand off to setup.sh. Script does its own tee-to-/var/log/joppa-setup.log,
-  # so don't double-pipe here.
-  - cd /opt/dr-bootstrap && bash bootstrap/setup.sh phase1
+  # Note: setup.sh phase1 is NOT invoked here. The wrapper on wallypad
+  # (./uluhe switch <vendor>) ssh's in over Tailscale to drive phase1 with an
+  # interactive PTY for the age passphrase prompt. See dr-bootstrap/uluhe.
 
-final_message: "Cloud-init complete on ${hostname}. Bootstrap continues in setup.sh."
+final_message: "Cloud-init complete on ${hostname}. Ready for operator handoff — wrapper will ssh in to run setup.sh phase1."
