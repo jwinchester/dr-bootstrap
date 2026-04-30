@@ -58,6 +58,14 @@ write_files:
 
   # Tarball fetch helper — bytes-only, no shell expansion of secrets via curl
   # cmdline. Falls back to git-clone if the env file says we don't have a token.
+  #
+  # IMPORTANT: this script body uses bare `$VAR` (not `${VAR}`) deliberately.
+  # Terraform's templatefile() interpolates `${...}` placeholders, and we
+  # learned in FD1 that cloud-init's runtime template engine ALSO eats
+  # bare `${...}` in rendered content. With our env-file pattern the vars
+  # are always set (templated content writes them, even if to empty), so
+  # set -u is safe with `$VAR`. Avoiding `${...}` here means we don't have
+  # to fight either template engine.
   - path: /usr/local/sbin/fetch-dr-bootstrap
     permissions: "0755"
     owner: root:root
@@ -66,13 +74,13 @@ write_files:
       set -euo pipefail
       . /etc/joppa/b2-fetch.env
       mkdir -p /opt/dr-bootstrap
-      if [ -n "$${B2_AUTH_TOKEN:-}" ] && [ -n "$${TARBALL_NAME:-}" ] && [ -n "$${B2_DOWNLOAD_URL:-}" ]; then
-        echo "[fetch-dr-bootstrap] B2 path: $${TARBALL_NAME}"
+      if [ -n "$B2_AUTH_TOKEN" ] && [ -n "$TARBALL_NAME" ] && [ -n "$B2_DOWNLOAD_URL" ]; then
+        echo "[fetch-dr-bootstrap] B2 path: $TARBALL_NAME"
         TMP=$(mktemp -t drb-XXXXXX.tar.gz)
         # Token in Authorization header; never on cmdline; download URL from B2 auth response.
         curl -fsS -o "$TMP" \
-             -H "Authorization: $${B2_AUTH_TOKEN}" \
-             "$${B2_DOWNLOAD_URL}/file/uluhe-secrets/$${TARBALL_NAME}"
+             -H "Authorization: $B2_AUTH_TOKEN" \
+             "$B2_DOWNLOAD_URL/file/uluhe-secrets/$TARBALL_NAME"
         # Tarball uses prefix=dr-bootstrap/, so strip-components=1 lands files at /opt/dr-bootstrap/.
         tar -xzf "$TMP" -C /opt/dr-bootstrap --strip-components=1
         shred -u "$TMP" 2>/dev/null || rm -f "$TMP"
