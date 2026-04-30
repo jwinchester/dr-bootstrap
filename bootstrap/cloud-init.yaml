@@ -46,4 +46,4 @@ runcmd:
   # so don't double-pipe here.
   - cd /opt/dr-bootstrap && bash bootstrap/setup.sh phase1
 
-final_message: "Cloud-init complete on $${hostname}. Bootstrap continues in setup.sh."
+final_message: "Cloud-init complete on ${hostname}. Bootstrap continues in setup.sh."
