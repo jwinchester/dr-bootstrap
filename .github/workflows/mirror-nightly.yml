@@ -1,16 +1,20 @@
-name: Nightly mirror to Codeberg + B2
+name: Nightly mirror to B2
 
 # Mirrors this repo nightly so dr-bootstrap survives a GitHub-side outage
 # (e.g. account suspension, network partition).
 #
-# Targets:
-#   1. Codeberg (https://codeberg.org/jwinchester/dr-bootstrap)
-#   2. B2 tarball: uluhe-secrets/dr-bootstrap-YYYY-MM-DD.tar.gz
+# Target: b2://uluhe-secrets/dr-bootstrap-YYYY-MM-DD.tar.gz
 #
-# Secrets needed in repo settings:
-#   CODEBERG_TOKEN    — Codeberg deploy token with push access
-#   B2_ACCOUNT_ID     — B2 application key ID (uluhe-secrets bucket scope)
-#   B2_ACCOUNT_KEY    — B2 application key
+# The cloud-init path on a fresh joppa VM fetches this tarball with a
+# short-lived B2 download authorization minted by the wrapper, so the failover
+# path no longer assumes GitHub is reachable.
+#
+# Codeberg push is a separable second mirror; intentionally deferred until an
+# account exists. See STATUS.md.
+#
+# Repo secrets used:
+#   B2_ACCOUNT_ID   — secrets-uluhe keyID (RW on uluhe-secrets bucket)
+#   B2_ACCOUNT_KEY  — secrets-uluhe applicationKey
 
 on:
   schedule:
@@ -21,30 +25,79 @@ jobs:
   mirror:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout (full history)
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      # TODO: add Codeberg push step
-      # - name: Push to Codeberg
-      #   env:
-      #     CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
-      #   run: |
-      #     git remote add codeberg https://jwinchester:${CODEBERG_TOKEN}@codeberg.org/jwinchester/dr-bootstrap.git
-      #     git push codeberg --mirror
+      - name: Build tarball from HEAD
+        id: tar
+        run: |
+          STAMP=$(date -u +%Y-%m-%d)
+          TARBALL="dr-bootstrap-${STAMP}.tar.gz"
+          git archive --format=tar.gz --prefix=dr-bootstrap/ HEAD -o "/tmp/${TARBALL}"
+          ls -l "/tmp/${TARBALL}"
+          echo "tarball=${TARBALL}" >>"$GITHUB_OUTPUT"
+          echo "path=/tmp/${TARBALL}" >>"$GITHUB_OUTPUT"
+          echo "sha1=$(sha1sum "/tmp/${TARBALL}" | awk '{print $1}')" >>"$GITHUB_OUTPUT"
+          echo "size=$(stat -c%s "/tmp/${TARBALL}")" >>"$GITHUB_OUTPUT"
 
-      # TODO: add B2 tarball upload step
-      # - name: Upload tarball to B2
-      #   env:
-      #     B2_ACCOUNT_ID:  ${{ secrets.B2_ACCOUNT_ID }}
-      #     B2_ACCOUNT_KEY: ${{ secrets.B2_ACCOUNT_KEY }}
-      #   run: |
-      #     pip install b2
-      #     STAMP=$(date -u +%Y-%m-%d)
-      #     git archive --format=tar.gz HEAD -o /tmp/dr-bootstrap-${STAMP}.tar.gz
-      #     b2 authorize-account "$B2_ACCOUNT_ID" "$B2_ACCOUNT_KEY"
-      #     b2 file upload uluhe-secrets /tmp/dr-bootstrap-${STAMP}.tar.gz dr-bootstrap-${STAMP}.tar.gz
+      - name: Upload tarball to B2 (uluhe-secrets)
+        env:
+          B2_ACCOUNT_ID:  ${{ secrets.B2_ACCOUNT_ID }}
+          B2_ACCOUNT_KEY: ${{ secrets.B2_ACCOUNT_KEY }}
+          BUCKET: uluhe-secrets
+          TARBALL: ${{ steps.tar.outputs.tarball }}
+          TARPATH: ${{ steps.tar.outputs.path }}
+          SHA1:    ${{ steps.tar.outputs.sha1 }}
+          SIZE:    ${{ steps.tar.outputs.size }}
+        run: |
+          set -euo pipefail
+          if [ -z "${B2_ACCOUNT_ID:-}" ] || [ -z "${B2_ACCOUNT_KEY:-}" ]; then
+            echo "ERROR: B2_ACCOUNT_ID and B2_ACCOUNT_KEY repo secrets must be set." >&2
+            exit 1
+          fi
 
-      - name: Stub
-        run: echo "Mirror workflow skeleton — TODO fill in steps"
+          echo "Authorizing with B2…"
+          AUTH=$(curl -fsS -u "${B2_ACCOUNT_ID}:${B2_ACCOUNT_KEY}" \
+            https://api.backblazeb2.com/b2api/v3/b2_authorize_account)
+
+          read API_URL TOKEN BUCKET_ID < <(python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)
+          sa = d["apiInfo"]["storageApi"]
+          name = sa.get("bucketName")
+          if name and name != "uluhe-secrets":
+              sys.stderr.write(f"FAIL: key is scoped to {name!r}, not uluhe-secrets\n")
+              sys.exit(1)
+          print(sa["apiUrl"], d["authorizationToken"], sa.get("bucketId",""))
+          ' <<<"$AUTH")
+
+          if [ -z "$BUCKET_ID" ]; then
+            BUCKET_ID=$(curl -fsS -H "Authorization: $TOKEN" \
+              -d "{\"accountId\":\"${B2_ACCOUNT_ID}\",\"bucketName\":\"${BUCKET}\"}" \
+              "${API_URL}/b2api/v3/b2_list_buckets" |
+              python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["buckets"][0]["bucketId"]) if d.get("buckets") else None')
+          fi
+          [ -n "$BUCKET_ID" ] || { echo "FAIL: could not resolve bucket id for $BUCKET" >&2; exit 1; }
+
+          echo "Getting upload URL…"
+          UP=$(curl -fsS -H "Authorization: $TOKEN" \
+                 -d "{\"bucketId\":\"${BUCKET_ID}\"}" \
+                 "${API_URL}/b2api/v3/b2_get_upload_url")
+          read UPLOAD_URL UPLOAD_TOKEN < <(python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["uploadUrl"], d["authorizationToken"])' <<<"$UP")
+
+          echo "Uploading ${TARBALL} (${SIZE} bytes, sha1=${SHA1:0:8}…)"
+          RESP=$(curl -fsS -X POST \
+            -H "Authorization: $UPLOAD_TOKEN" \
+            -H "X-Bz-File-Name: ${TARBALL}" \
+            -H "Content-Type: application/gzip" \
+            -H "Content-Length: ${SIZE}" \
+            -H "X-Bz-Content-Sha1: ${SHA1}" \
+            --data-binary "@${TARPATH}" \
+            "$UPLOAD_URL")
+          GOT_SHA1=$(python3 -c 'import sys,json; print(json.load(sys.stdin).get("contentSha1",""))' <<<"$RESP")
+          if [ "$GOT_SHA1" != "$SHA1" ]; then
+            echo "FAIL: server sha1=${GOT_SHA1} != local sha1=${SHA1}" >&2
+            echo "$RESP" | head -c 500 >&2
+            exit 1
+          fi
+          echo "OK: ${TARBALL} uploaded (sha1 verified)"
