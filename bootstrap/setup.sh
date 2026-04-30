@@ -222,6 +222,18 @@ PY
     log "  WARN: $SECRETS_DIR/agent-tokens.enc not present — /etc/joppa-bots/agent.env not populated; joppa-agent.service AND lotor.service will fail to start until operator hand-places it"
   fi
 
+  # --- /etc/hcloud/cli.toml (Hetzner Cloud API token for terraform + lotor) ---
+  # Optional: only needed on hosts that provision/manage Hetzner resources
+  # (operator wallypad, lotor for cost queries). Failover-target VMs may also
+  # want it if they'll run Terraform for further failover.
+  if [ -f "$SECRETS_DIR/hetzner-tokens.enc" ]; then
+    install -d -m 0700 -o root -g root /etc/hcloud
+    log "  hetzner-tokens.enc → /etc/hcloud/cli.toml"
+    decrypt_with_identity "$SECRETS_DIR/hetzner-tokens.enc" /etc/hcloud/cli.toml
+    chown root:root /etc/hcloud/cli.toml
+    chmod 0600 /etc/hcloud/cli.toml
+  fi
+
   # --- privacy-cards.csv → tmpfs (volatile, never on disk) ---
   log "  privacy-cards.csv.enc → $RUNTIME_TMPFS/privacy-cards.csv (tmpfs, volatile)"
   decrypt_with_identity "$SECRETS_DIR/privacy-cards.csv.enc" "$RUNTIME_TMPFS/privacy-cards.csv"
