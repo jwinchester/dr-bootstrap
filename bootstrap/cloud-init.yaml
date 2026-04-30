@@ -2,6 +2,9 @@
 # Minimal cloud-init for fresh joppa VM. Templated by Terraform with:
 #   - tailscale_auth_key: pre-minted, single-use
 #   - hostname:           target hostname (e.g. hetz-2, do-1, orac-1)
+#   - b2_download_url:    base URL for b2://uluhe-secrets/ downloads
+#   - b2_auth_token:      short-lived prefix-scoped download token
+#   - tarball_name:       e.g. dr-bootstrap-2026-04-30.tar.gz
 #
 # Provisioning-only — does NOT invoke setup.sh phase1. The operator wrapper
 # (./uluhe switch <vendor>) drives phase1 over Tailscale SSH so the age
@@ -12,8 +15,15 @@
 #   1. set hostname
 #   2. install tailscale + age + git + restic + python deps
 #   3. join tailnet
-#   4. clone dr-bootstrap repo (so wrapper can ssh in and run setup.sh)
+#   4. fetch dr-bootstrap into /opt/dr-bootstrap (B2 tarball preferred,
+#      git-clone fallback if no tarball was supplied)
 # Restore + services + secrets handoff happen in setup.sh, driven from wallypad.
+#
+# Why B2 tarball instead of `git clone`: the GitHub repo can be private
+# (no anonymous clone) and even if GitHub is unreachable during the outage
+# that triggered failover, the tarball + restic data live in B2 with the same
+# auth chain. The token is minted with a ~1h TTL and prefix-scoped to
+# "dr-bootstrap-", so a metadata-leak post-boot exposes ~nothing.
 
 hostname: ${hostname}
 
@@ -36,14 +46,52 @@ write_files:
     content: "primary"
     permissions: "0644"
 
+  # Templated B2 download params; consumed by /usr/local/sbin/fetch-dr-bootstrap.
+  # Mode 0600 + root-owned so non-root users on the VM never see the token.
+  - path: /etc/joppa/b2-fetch.env
+    permissions: "0600"
+    owner: root:root
+    content: |
+      B2_DOWNLOAD_URL=${b2_download_url}
+      B2_AUTH_TOKEN=${b2_auth_token}
+      TARBALL_NAME=${tarball_name}
+
+  # Tarball fetch helper — bytes-only, no shell expansion of secrets via curl
+  # cmdline. Falls back to git-clone if the env file says we don't have a token.
+  - path: /usr/local/sbin/fetch-dr-bootstrap
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      . /etc/joppa/b2-fetch.env
+      mkdir -p /opt/dr-bootstrap
+      if [ -n "$${B2_AUTH_TOKEN:-}" ] && [ -n "$${TARBALL_NAME:-}" ] && [ -n "$${B2_DOWNLOAD_URL:-}" ]; then
+        echo "[fetch-dr-bootstrap] B2 path: $${TARBALL_NAME}"
+        TMP=$(mktemp -t drb-XXXXXX.tar.gz)
+        # Token in Authorization header; never on cmdline; download URL from B2 auth response.
+        curl -fsS -o "$TMP" \
+             -H "Authorization: $${B2_AUTH_TOKEN}" \
+             "$${B2_DOWNLOAD_URL}/file/uluhe-secrets/$${TARBALL_NAME}"
+        # Tarball uses prefix=dr-bootstrap/, so strip-components=1 lands files at /opt/dr-bootstrap/.
+        tar -xzf "$TMP" -C /opt/dr-bootstrap --strip-components=1
+        shred -u "$TMP" 2>/dev/null || rm -f "$TMP"
+        # Wipe the token file so a later host compromise can't replay the URL.
+        # Token TTL is ~1h anyway, but defense-in-depth.
+        shred -u /etc/joppa/b2-fetch.env 2>/dev/null || rm -f /etc/joppa/b2-fetch.env
+        echo "[fetch-dr-bootstrap] B2 fetch OK"
+      else
+        echo "[fetch-dr-bootstrap] no B2 token — falling back to public git clone"
+        git clone https://github.com/jwinchester/dr-bootstrap.git /opt/dr-bootstrap
+      fi
+
 runcmd:
   # Tailscale install + join (single-use auth key, will need rotation post-failover)
   - curl -fsSL https://tailscale.com/install.sh | sh
   - tailscale up --auth-key=${tailscale_auth_key} --hostname=${hostname} --ssh
 
-  # Clone dr-bootstrap (TODO: switch to GitHub deploy key + private clone)
-  - mkdir -p /opt/dr-bootstrap
-  - git clone https://github.com/jwinchester/dr-bootstrap.git /opt/dr-bootstrap
+  # Fetch dr-bootstrap (B2 tarball preferred; git-clone fallback)
+  - /usr/local/sbin/fetch-dr-bootstrap
 
   # Note: setup.sh phase1 is NOT invoked here. The wrapper on wallypad
   # (./uluhe switch <vendor>) ssh's in over Tailscale to drive phase1 with an

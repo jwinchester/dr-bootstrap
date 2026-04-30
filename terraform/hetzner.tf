@@ -48,6 +48,9 @@ resource "hcloud_server" "joppa" {
   user_data = templatefile("${path.module}/../bootstrap/cloud-init.yaml", {
     tailscale_auth_key = var.tailscale_auth_key
     hostname           = var.vm_hostname
+    b2_download_url    = var.b2_download_url
+    b2_auth_token      = var.b2_auth_token
+    tarball_name       = var.tarball_name
   })
 
   labels = {

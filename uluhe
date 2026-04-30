@@ -212,20 +212,156 @@ cmd_status() {
   echo
 }
 
+# prep_b2_creds — decrypt b2-keys.enc once and extract everything we need.
+#
+# Sets these globals (caller treats as read-only):
+#   B2_SECRETS_KEY_ID     secrets-uluhe keyID (used for orchestrate_phase1's
+#                         secrets/*.enc fetch on the VM)
+#   B2_SECRETS_KEY        secrets-uluhe applicationKey (ditto)
+#   B2_DOWNLOAD_URL       the storageApi.downloadUrl from b2_authorize_account
+#                         (templated into cloud-init for tarball fetch)
+#   B2_DOWNLOAD_TOKEN     short-lived prefix-scoped download token for
+#                         "dr-bootstrap-" tarballs (~1h TTL; templated into
+#                         cloud-init)
+#   B2_TARBALL_NAME       name of the most recent dr-bootstrap-*.tar.gz
+#                         (empty if none exist — caller may abort or fall back)
+#
+# Why one place: b2-keys.enc is the bottleneck for the operator's age
+# passphrase prompt. Doing it here means the operator only types the
+# wallypad-side passphrase once per ./uluhe switch.
+prep_b2_creds() {
+  local SECRETS_DIR_LOCAL="${REPO_DIR}/../secrets"
+  local AGE_KEY_ENC_LOCAL="${HOME}/.config/dr/age-key.enc"
+  local B2_KEYS_ENC="${SECRETS_DIR_LOCAL}/b2-keys.enc"
+
+  [ -f "$AGE_KEY_ENC_LOCAL" ] || { echo "ERROR: missing $AGE_KEY_ENC_LOCAL" >&2; return 1; }
+  [ -f "$B2_KEYS_ENC" ]       || { echo "ERROR: missing $B2_KEYS_ENC" >&2; return 1; }
+
+  echo "Decrypting b2-keys.enc (age passphrase prompt — wallypad side)…"
+  local TMPDIR_PREP
+  TMPDIR_PREP="$(mktemp -d -t uluhe-prep-XXXXXX)"
+  chmod 700 "$TMPDIR_PREP"
+  # Local cleanup trap (overrides any earlier RETURN trap on this function).
+  # shellcheck disable=SC2064
+  trap "find '$TMPDIR_PREP' -type f -exec shred -u {} \\; 2>/dev/null; rm -rf '$TMPDIR_PREP'" RETURN
+
+  if ! age -d -o "$TMPDIR_PREP/id" "$AGE_KEY_ENC_LOCAL"; then
+    echo "ERROR: age identity decrypt failed (wrong passphrase?)" >&2
+    return 1
+  fi
+  if ! age -d -i "$TMPDIR_PREP/id" -o "$TMPDIR_PREP/b2-keys.txt" "$B2_KEYS_ENC"; then
+    echo "ERROR: b2-keys.enc decrypt failed" >&2
+    return 1
+  fi
+
+  read -r B2_SECRETS_KEY_ID B2_SECRETS_KEY < <(python3 - "$TMPDIR_PREP/b2-keys.txt" <<'PY'
+import sys
+src = sys.argv[1]
+LABELS = {"keyID","keyName","applicationKey"}
+lines = [ln.rstrip("\n") for ln in open(src)]
+entries, cur, i = [], {}, 0
+while i < len(lines):
+    s = lines[i].strip()
+    if not s:
+        if cur: entries.append(cur); cur = {}
+        i += 1; continue
+    if s.endswith(":") and s[:-1] in LABELS:
+        label = s[:-1]
+        j = i + 1
+        while j < len(lines) and not lines[j].strip(): j += 1
+        if j < len(lines):
+            if label in cur: entries.append(cur); cur = {}
+            cur[label] = lines[j].strip()
+        i = j + 1
+    else:
+        i += 1
+if cur: entries.append(cur)
+target = next((e for e in entries if e.get("keyName") == "secrets-uluhe"), None)
+if not target:
+    sys.stderr.write("FAIL: secrets-uluhe not in b2-keys.enc; available: " +
+        ", ".join(repr(e.get("keyName")) for e in entries) + "\n")
+    sys.exit(1)
+print(target["keyID"], target["applicationKey"])
+PY
+  ) || true
+  if [ -z "${B2_SECRETS_KEY_ID:-}" ] || [ -z "${B2_SECRETS_KEY:-}" ]; then
+    echo "ERROR: secrets-uluhe creds not extracted" >&2
+    return 1
+  fi
+  echo "  secrets-uluhe extracted (id prefix: ${B2_SECRETS_KEY_ID:0:8}…)"
+
+  # b2_authorize_account → API URL + download URL + master token + (scoped) bucketId
+  local AUTH_JSON
+  AUTH_JSON=$(curl -fsS -u "${B2_SECRETS_KEY_ID}:${B2_SECRETS_KEY}" \
+    https://api.backblazeb2.com/b2api/v3/b2_authorize_account) \
+    || { echo "ERROR: b2_authorize_account failed" >&2; return 1; }
+
+  local API_URL TOKEN BUCKET_ID
+  read -r API_URL B2_DOWNLOAD_URL TOKEN BUCKET_ID < <(python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+sa = d["apiInfo"]["storageApi"]
+print(sa["apiUrl"], sa["downloadUrl"], d["authorizationToken"], sa.get("bucketId",""))
+' <<<"$AUTH_JSON")
+
+  if [ -z "$BUCKET_ID" ]; then
+    BUCKET_ID=$(curl -fsS -H "Authorization: $TOKEN" \
+      -d "{\"accountId\":\"${B2_SECRETS_KEY_ID}\",\"bucketName\":\"uluhe-secrets\"}" \
+      "${API_URL}/b2api/v3/b2_list_buckets" |
+      python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["buckets"][0]["bucketId"]) if d.get("buckets") else None')
+  fi
+  [ -n "$BUCKET_ID" ] || { echo "ERROR: could not resolve bucket id for uluhe-secrets" >&2; return 1; }
+
+  # Find the most recent dr-bootstrap-*.tar.gz. b2_list_file_names returns files
+  # in lex order, which is also chronological for our YYYY-MM-DD naming.
+  local LIST_RESP
+  LIST_RESP=$(curl -fsS -H "Authorization: $TOKEN" \
+    -d "{\"bucketId\":\"${BUCKET_ID}\",\"maxFileCount\":100,\"prefix\":\"dr-bootstrap-\"}" \
+    "${API_URL}/b2api/v3/b2_list_file_names") \
+    || { echo "ERROR: b2_list_file_names failed" >&2; return 1; }
+
+  B2_TARBALL_NAME=$(python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+names = [f["fileName"] for f in d.get("files", []) if f["fileName"].endswith(".tar.gz")]
+print(names[-1] if names else "")
+' <<<"$LIST_RESP")
+
+  if [ -z "$B2_TARBALL_NAME" ]; then
+    echo "  WARN: no dr-bootstrap-*.tar.gz in b2://uluhe-secrets/ — cloud-init will fall back to git clone."
+    B2_DOWNLOAD_TOKEN=""
+    return 0
+  fi
+  echo "  latest tarball: $B2_TARBALL_NAME"
+
+  # b2_get_download_authorization with prefix scope + 1h TTL.
+  # The token returned is what the VM uses; the master TOKEN above stays here.
+  local DLA_RESP
+  DLA_RESP=$(curl -fsS -H "Authorization: $TOKEN" \
+    -d "{\"bucketId\":\"${BUCKET_ID}\",\"fileNamePrefix\":\"dr-bootstrap-\",\"validDurationInSeconds\":3600}" \
+    "${API_URL}/b2api/v3/b2_get_download_authorization") \
+    || { echo "ERROR: b2_get_download_authorization failed" >&2; return 1; }
+
+  B2_DOWNLOAD_TOKEN=$(python3 -c 'import sys,json; print(json.load(sys.stdin)["authorizationToken"])' <<<"$DLA_RESP")
+  [ -n "$B2_DOWNLOAD_TOKEN" ] || { echo "ERROR: empty download token" >&2; return 1; }
+  echo "  download token minted (prefix=dr-bootstrap-, TTL=1h)"
+}
+
 # orchestrate_phase1 — drive secrets-fetch + setup.sh phase1 over SSH against
 # a freshly-provisioned VM. Called from cmd_switch after terraform apply.
 #
 # Flow:
 #   1. Wait for sshd; wait for cloud-init to finish (cloud-init status --wait)
-#   2. Locally decrypt b2-keys.enc → extract `secrets-uluhe` keyID + applicationKey
-#      (passphrase prompt #1 of 2)
+#   2. Use already-extracted secrets-uluhe creds (from prep_b2_creds) — no
+#      second passphrase prompt on the wallypad side.
 #   3. scp scripts/fetch-secrets-from-b2.sh to VM, run it with B2 creds piped
 #      via stdin (never on command line, never persisted)
 #   4. ssh -t for setup.sh phase1 — operator types passphrase at the VM-side
-#      age prompt (passphrase prompt #2 of 2; same passphrase, different sides)
+#      age prompt (the only on-VM passphrase prompt; same passphrase, different host)
 #   5. Report exit; on failure, stream tail of /var/log/joppa-setup.log
 #
 # Args: $1=ipv4, $2=hostname, $3=test_mode (0|1)
+# Reads globals: B2_SECRETS_KEY_ID, B2_SECRETS_KEY (set by prep_b2_creds).
 # Uses operator's wallypad SSH key (uploaded to Hetzner project as "wallypad");
 # sshd on Hetzner public IPv4 is reachable before Tailscale converges.
 orchestrate_phase1() {
@@ -257,7 +393,7 @@ orchestrate_phase1() {
   fi
   ok "sshd reachable"
 
-  echo "[orch 2/4] waiting for cloud-init to finish (this is the apt-update + tailscale-install + git-clone leg; max 10min)…"
+  echo "[orch 2/4] waiting for cloud-init to finish (apt-update + tailscale-install + B2-tarball-fetch; max 10min)…"
   if ! timeout 600 ssh -o StrictHostKeyChecking=accept-new \
            -o UserKnownHostsFile=/dev/null \
            "root@${ipv4}" 'cloud-init status --wait'; then
@@ -267,76 +403,18 @@ orchestrate_phase1() {
   fi
   ok "cloud-init complete"
 
-  # ---- Step 2: extract B2 secrets-uluhe creds locally ----
-  echo "[orch 3/4] extracting B2 secrets-uluhe key from local b2-keys.enc"
-  echo "  (you will be prompted for the age passphrase — 1st of 2 prompts)"
+  # ---- Step 2: B2 secrets-uluhe creds come from prep_b2_creds ----
+  if [ -z "${B2_SECRETS_KEY_ID:-}" ] || [ -z "${B2_SECRETS_KEY:-}" ]; then
+    echo "ERROR: B2_SECRETS_KEY_ID/B2_SECRETS_KEY not set — prep_b2_creds must run first" >&2
+    return 1
+  fi
+  local b2_id="$B2_SECRETS_KEY_ID" b2_key="$B2_SECRETS_KEY"
 
-  local SECRETS_DIR_LOCAL="${REPO_DIR}/../secrets"
-  local AGE_KEY_ENC_LOCAL="${HOME}/.config/dr/age-key.enc"
-  local B2_KEYS_ENC="${SECRETS_DIR_LOCAL}/b2-keys.enc"
   local FETCH_SCRIPT="${REPO_DIR}/../scripts/fetch-secrets-from-b2.sh"
-
-  [ -f "$AGE_KEY_ENC_LOCAL" ] || { echo "ERROR: missing $AGE_KEY_ENC_LOCAL" >&2; return 1; }
-  [ -f "$B2_KEYS_ENC" ]       || { echo "ERROR: missing $B2_KEYS_ENC" >&2; return 1; }
-  [ -f "$FETCH_SCRIPT" ]      || { echo "ERROR: missing $FETCH_SCRIPT" >&2; return 1; }
-
-  local TMPDIR_ORCH
-  TMPDIR_ORCH="$(mktemp -d -t uluhe-orch-XXXXXX)"
-  chmod 700 "$TMPDIR_ORCH"
-  # Local cleanup trap (overrides any earlier RETURN trap on this function).
-  # shellcheck disable=SC2064
-  trap "find '$TMPDIR_ORCH' -type f -exec shred -u {} \\; 2>/dev/null; rm -rf '$TMPDIR_ORCH'" RETURN
-
-  if ! age -d -o "$TMPDIR_ORCH/id" "$AGE_KEY_ENC_LOCAL"; then
-    echo "ERROR: age identity decrypt failed (wrong passphrase?)" >&2
-    return 1
-  fi
-  if ! age -d -i "$TMPDIR_ORCH/id" -o "$TMPDIR_ORCH/b2-keys.txt" "$B2_KEYS_ENC"; then
-    echo "ERROR: b2-keys.enc decrypt failed" >&2
-    return 1
-  fi
-
-  local b2_id b2_key
-  # `|| true` so that a python parser failure (which writes to stderr but no
-  # stdout) doesn't trigger set -e before the empty-cred guard below runs.
-  read -r b2_id b2_key < <(python3 - "$TMPDIR_ORCH/b2-keys.txt" <<'PY'
-import sys
-src = sys.argv[1]
-LABELS = {"keyID","keyName","applicationKey"}
-lines = [ln.rstrip("\n") for ln in open(src)]
-entries, cur, i = [], {}, 0
-while i < len(lines):
-    s = lines[i].strip()
-    if not s:
-        if cur: entries.append(cur); cur = {}
-        i += 1; continue
-    if s.endswith(":") and s[:-1] in LABELS:
-        label = s[:-1]
-        j = i + 1
-        while j < len(lines) and not lines[j].strip(): j += 1
-        if j < len(lines):
-            if label in cur: entries.append(cur); cur = {}
-            cur[label] = lines[j].strip()
-        i = j + 1
-    else:
-        i += 1
-if cur: entries.append(cur)
-target = next((e for e in entries if e.get("keyName") == "secrets-uluhe"), None)
-if not target:
-    sys.stderr.write("FAIL: secrets-uluhe not in b2-keys.enc; available: " +
-        ", ".join(repr(e.get("keyName")) for e in entries) + "\n")
-    sys.exit(1)
-print(target["keyID"], target["applicationKey"])
-PY
-  ) || true
-  if [ -z "$b2_id" ] || [ -z "$b2_key" ]; then
-    echo "ERROR: secrets-uluhe creds not extracted" >&2
-    return 1
-  fi
-  ok "secrets-uluhe extracted (id prefix: ${b2_id:0:8}…)"
+  [ -f "$FETCH_SCRIPT" ] || { echo "ERROR: missing $FETCH_SCRIPT" >&2; return 1; }
 
   # ---- Step 3: copy fetch script + run on VM with creds via stdin ----
-  echo "[orch 4/4] copying fetch-secrets-from-b2.sh to VM and running it"
+  echo "[orch 3/4] copying fetch-secrets-from-b2.sh to VM and running it"
 
   if ! ssh -o StrictHostKeyChecking=accept-new \
             -o UserKnownHostsFile=/dev/null \
@@ -522,6 +600,20 @@ cmd_switch() {
     [ "$confirm" = "yes" ] || { echo "aborted"; return 1; }
   fi
 
+  # Decrypt b2-keys.enc + mint short-lived download token for cloud-init
+  # tarball fetch. Same age passphrase prompt covers both this and the
+  # later orchestrate_phase1 secrets-fetch — operator types it ONCE per switch.
+  if [ "$orchestrate" = 1 ]; then
+    if ! prep_b2_creds; then
+      echo "ERROR: prep_b2_creds failed; aborting before terraform apply" >&2
+      unset TS_AUTH_KEY
+      return 1
+    fi
+  else
+    echo "(--no-orchestrate: skipping prep_b2_creds; cloud-init will fall back to git clone)"
+    B2_DOWNLOAD_URL=""; B2_DOWNLOAD_TOKEN=""; B2_TARBALL_NAME=""
+  fi
+
   echo
   echo "[1/3] terraform init"
   "$TF" init -upgrade -no-color || { echo "ERROR: terraform init failed" >&2; return 1; }
@@ -532,6 +624,9 @@ cmd_switch() {
     -var=vendor=hetzner \
     -var=vm_hostname="$VM_HOSTNAME" \
     -var=tailscale_auth_key="$TS_AUTH_KEY" \
+    -var=b2_download_url="${B2_DOWNLOAD_URL:-}" \
+    -var=b2_auth_token="${B2_DOWNLOAD_TOKEN:-}" \
+    -var=tarball_name="${B2_TARBALL_NAME:-}" \
     || { echo "ERROR: terraform apply failed" >&2; return 1; }
   unset TS_AUTH_KEY
 
